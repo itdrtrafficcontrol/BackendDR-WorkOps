@@ -1,0 +1,363 @@
+import {
+  invalidateConfirmationsForChangedShiftDates,
+  normalizeWorkOrderShifts,
+  placeNewShiftsFirstWithinDates,
+  preserveOtherWorkerConfirmations,
+  snapshotWorkerConfirmations,
+  updateShiftWorkerConfirmation,
+} from './work-order-shifts.util';
+
+describe('placeNewShiftsFirstWithinDates', () => {
+  it('puts a new shift first on its date without moving edited shifts', () => {
+    const previous = [
+      { id: 'shift-a', date: '2026-08-12' },
+      { id: 'shift-b', date: '2026-08-12' },
+    ];
+
+    expect(
+      placeNewShiftsFirstWithinDates(
+        [
+          { id: 'shift-a', date: '2026-08-12', shiftName: 'Edited' },
+          { id: 'shift-b', date: '2026-08-12' },
+          { id: 'shift-new', date: '2026-08-12' },
+        ],
+        previous,
+      ).map((shift) => shift.id),
+    ).toEqual(['shift-new', 'shift-a', 'shift-b']);
+  });
+});
+import {
+  computeShiftStatus,
+  InMemoryShiftCompletionLookup,
+} from './shift-status.util';
+
+describe('invalidateConfirmationsForChangedShiftDates', () => {
+  const previous = [
+    {
+      id: 'shift-1',
+      date: '2026-08-11',
+      status: 'ready_to_notify',
+      roles: [
+        {
+          id: 'role-1',
+          roleName: 'Flagger',
+          requiredCount: 2,
+          assignedWorkers: ['worker-a', 'worker-b'],
+          workerConfirmations: [
+            {
+              workerId: 'worker-a',
+              status: 'confirmed',
+              respondedAt: '2026-08-10T10:00:00.000Z',
+              requestedAt: '2026-08-09T10:00:00.000Z',
+              notificationChannel: 'in_app',
+            },
+            {
+              workerId: 'worker-b',
+              status: 'declined',
+              respondedAt: '2026-08-10T11:00:00.000Z',
+              requestedAt: '2026-08-09T10:00:00.000Z',
+              notificationChannel: 'sms',
+            },
+          ],
+        },
+      ],
+    },
+  ];
+
+  it('resets every response and request when the shift date changes', () => {
+    const changed = invalidateConfirmationsForChangedShiftDates(
+      [{ ...previous[0], date: '2026-08-12' }],
+      previous,
+    );
+
+    expect(changed[0]).toMatchObject({
+      date: '2026-08-12',
+      status: 'ready_to_notify',
+      confirmationResetReason: 'date_changed',
+    });
+    expect(
+      (changed[0].roles as Array<Record<string, unknown>>)[0]
+        .workerConfirmations,
+    ).toEqual([
+      { workerId: 'worker-a', status: 'pending' },
+      { workerId: 'worker-b', status: 'pending' },
+    ]);
+
+    expect(
+      computeShiftStatus({
+        workOrderId: 'wo-1',
+        shift: changed[0],
+        completion: new InMemoryShiftCompletionLookup(),
+      }).status,
+    ).toBe('ready_to_notify');
+
+    const requested = {
+      ...changed[0],
+      roles: (changed[0].roles as Array<Record<string, unknown>>).map(
+        (role) => ({
+          ...role,
+          workerConfirmations: (
+            role.workerConfirmations as Array<Record<string, unknown>>
+          ).map((confirmation) => ({
+            ...confirmation,
+            requestedAt: '2026-08-11T12:00:00.000Z',
+            notificationChannel: 'in_app',
+          })),
+        }),
+      ),
+    };
+    expect(
+      computeShiftStatus({
+        workOrderId: 'wo-1',
+        shift: requested,
+        completion: new InMemoryShiftCompletionLookup(),
+      }).status,
+    ).toBe('awaiting_response');
+  });
+
+  it('preserves responses when another shift field changes', () => {
+    const unchangedDate = invalidateConfirmationsForChangedShiftDates(
+      [{ ...previous[0], shiftName: 'Updated name' }],
+      previous,
+    );
+
+    expect(
+      (unchangedDate[0].roles as Array<Record<string, unknown>>)[0]
+        .workerConfirmations,
+    ).toEqual(previous[0].roles[0].workerConfirmations);
+  });
+});
+
+const shiftsWithOneConfirmed = [
+  {
+    id: 'shift-1',
+    roles: [
+      {
+        id: 'role-1',
+        requiredCount: 2,
+        assignedWorkers: ['worker-a', 'worker-b'],
+        workerConfirmations: [
+          { workerId: 'worker-a', status: 'confirmed', respondedAt: '2026-06-06T10:00:00.000Z' },
+          { workerId: 'worker-b', status: 'pending' },
+        ],
+      },
+    ],
+  },
+];
+
+describe('updateShiftWorkerConfirmation', () => {
+  it('strips obsolete role resource fields from incoming payloads', () => {
+    const normalized = normalizeWorkOrderShifts([
+      {
+        id: 'shift-legacy-resources',
+        roles: [
+          {
+            id: 'role-legacy-resources',
+            roleName: 'Flagger',
+            requiredCount: 1,
+            assignedWorkers: [],
+            assignedEquipment: ['equipment-1'],
+            assignedMaterials: ['material-1'],
+            equipmentTypes: ['Truck'],
+            materialTypes: ['Cone'],
+          },
+        ],
+      },
+    ]);
+
+    expect(normalized[0].roles?.[0]).not.toHaveProperty('assignedEquipment');
+    expect(normalized[0].roles?.[0]).not.toHaveProperty('assignedMaterials');
+    expect(normalized[0].roles?.[0]).not.toHaveProperty('equipmentTypes');
+    expect(normalized[0].roles?.[0]).not.toHaveProperty('materialTypes');
+  });
+
+  it('normalizes and deduplicates Work Order Types on the shift', () => {
+    const normalized = normalizeWorkOrderShifts([
+      {
+        id: 'shift-types',
+        workOrderTypes: [' Field Service ', 'On Rent', 'On Rent', ''],
+        roles: [],
+      },
+    ]);
+
+    expect(normalized[0].workOrderTypes).toEqual(['Field Service', 'On Rent']);
+  });
+
+  it('preserves confirmations when normalizing an already saved shift', () => {
+    const normalized = normalizeWorkOrderShifts(
+      shiftsWithOneConfirmed,
+      shiftsWithOneConfirmed,
+    );
+
+    const role = normalized[0].roles?.[0] as { workerConfirmations?: Array<{ workerId: string; status: string }> };
+
+    expect(role.workerConfirmations).toEqual([
+      { workerId: 'worker-a', status: 'confirmed', respondedAt: '2026-06-06T10:00:00.000Z' },
+      { workerId: 'worker-b', status: 'pending' },
+    ]);
+  });
+
+  it('preserves existing worker confirmations when another worker confirms later', () => {
+    const next = updateShiftWorkerConfirmation(
+      shiftsWithOneConfirmed,
+      {
+        shiftId: 'shift-1',
+        roleId: 'role-1',
+        workerId: 'worker-b',
+      },
+      {
+        status: 'confirmed',
+        respondedAt: '2026-06-06T10:05:00.000Z',
+      },
+    );
+
+    const role = next[0].roles?.[0] as { workerConfirmations?: Array<{ workerId: string; status: string }> };
+
+    expect(role.workerConfirmations).toEqual([
+      { workerId: 'worker-a', status: 'confirmed', respondedAt: '2026-06-06T10:00:00.000Z' },
+      { workerId: 'worker-b', status: 'confirmed', respondedAt: '2026-06-06T10:05:00.000Z' },
+    ]);
+  });
+});
+
+describe('normalizeWorkOrderShifts - role id regeneration', () => {
+  it('preserves confirmations when frontend sends a new role id but keeps roleName and worker', () => {
+    const previous = [
+      {
+        id: 'shift-1',
+        roles: [
+          {
+            id: 'role-1',
+            roleName: 'Flagger',
+            requiredCount: 2,
+            assignedWorkers: ['worker-a', 'worker-b'],
+            workerConfirmations: [
+              { workerId: 'worker-a', status: 'confirmed', respondedAt: '2026-06-06T10:00:00.000Z' },
+              { workerId: 'worker-b', status: 'pending' },
+            ],
+          },
+        ],
+      },
+    ];
+    const incoming = [
+      {
+        id: 'shift-1',
+        roles: [
+          {
+            id: 'sr_shift-1_1718900000000_Flagger',
+            roleName: 'Flagger',
+            requiredCount: 2,
+            assignedWorkers: ['worker-a', 'worker-b'],
+          },
+        ],
+      },
+    ];
+
+    const normalized = normalizeWorkOrderShifts(incoming, previous);
+    const role = normalized[0].roles?.[0] as { workerConfirmations?: Array<{ workerId: string; status: string }> };
+
+    expect(role.workerConfirmations).toEqual([
+      { workerId: 'worker-a', status: 'confirmed', respondedAt: '2026-06-06T10:00:00.000Z' },
+      { workerId: 'worker-b', status: 'pending' },
+    ]);
+  });
+});
+
+describe('preserveOtherWorkerConfirmations', () => {
+  const baseShift = {
+    id: 'shift-1',
+    roles: [
+      {
+        id: 'role-1',
+        roleName: 'Flagger',
+        requiredCount: 2,
+        assignedWorkers: ['worker-a', 'worker-b'],
+        workerConfirmations: [
+          { workerId: 'worker-a', status: 'confirmed', respondedAt: '2026-06-06T10:00:00.000Z' },
+          { workerId: 'worker-b', status: 'confirmed', respondedAt: '2026-06-06T11:00:00.000Z' },
+        ],
+      },
+    ],
+  };
+
+  it('restores a peer confirmation that was wiped by a subsequent normalize', () => {
+    const snapshot = snapshotWorkerConfirmations([baseShift]);
+    const wiped = [
+      {
+        ...baseShift,
+        roles: [
+          {
+            ...baseShift.roles[0],
+            workerConfirmations: [
+              { workerId: 'worker-a', status: 'pending' },
+            ],
+          },
+        ],
+      },
+    ];
+    const restored = preserveOtherWorkerConfirmations(
+      wiped,
+      snapshot,
+      { shiftId: 'shift-1', roleId: 'role-1', workerId: 'worker-a' },
+    );
+    const role = restored[0].roles?.[0] as { workerConfirmations?: Array<{ workerId: string; status: string }> };
+    const b = role.workerConfirmations?.find((c) => c.workerId === 'worker-b');
+    expect(b?.status).toBe('confirmed');
+  });
+
+  it('keeps the target worker updated status and does not touch other roles', () => {
+    const snapshot = snapshotWorkerConfirmations([
+      {
+        ...baseShift,
+        roles: [
+          baseShift.roles[0],
+          {
+            id: 'role-2',
+            roleName: 'Foreman',
+            requiredCount: 1,
+            assignedWorkers: ['worker-c'],
+            workerConfirmations: [
+              { workerId: 'worker-c', status: 'confirmed' },
+            ],
+          },
+        ],
+      },
+    ]);
+    const mutated = [
+      {
+        ...baseShift,
+        roles: [
+          {
+            ...baseShift.roles[0],
+            workerConfirmations: [
+              { workerId: 'worker-a', status: 'pending' },
+            ],
+          },
+          {
+            id: 'role-2',
+            roleName: 'Foreman',
+            requiredCount: 1,
+            assignedWorkers: ['worker-c'],
+            workerConfirmations: [
+              { workerId: 'worker-c', status: 'pending' },
+            ],
+          },
+        ],
+      },
+    ];
+    const restored = preserveOtherWorkerConfirmations(
+      mutated,
+      snapshot,
+      { shiftId: 'shift-1', roleId: 'role-1', workerId: 'worker-a' },
+    );
+    const role1 = restored[0].roles?.[0] as { workerConfirmations?: Array<{ workerId: string; status: string }> };
+    const role2 = restored[0].roles?.[1] as { workerConfirmations?: Array<{ workerId: string; status: string }> };
+    const a = role1.workerConfirmations?.find((c) => c.workerId === 'worker-a');
+    const b = role1.workerConfirmations?.find((c) => c.workerId === 'worker-b');
+    const c = role2.workerConfirmations?.find((c) => c.workerId === 'worker-c');
+    expect(a?.status).toBe('pending');
+    expect(b?.status).toBe('confirmed');
+    /** Other roles are not touched by this helper; they need their own restore call. */
+    expect(c?.status).toBe('pending');
+  });
+});
