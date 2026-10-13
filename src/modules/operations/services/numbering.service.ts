@@ -42,7 +42,7 @@ export class NumberingService {
     if (settings.length === 0) return { ...DEFAULT_WORK_ORDER_NUMBERING };
     const s = settings[0];
     return {
-      prefix: s.workOrderNumberPrefix || DEFAULT_WORK_ORDER_NUMBERING.prefix,
+      prefix: s.workOrderNumberPrefix ?? DEFAULT_WORK_ORDER_NUMBERING.prefix,
       padding: s.workOrderNumberPadding || DEFAULT_WORK_ORDER_NUMBERING.padding,
       reset:
         (s.workOrderNumberReset as WorkOrderResetMode) ||
@@ -135,7 +135,6 @@ export class NumberingService {
     value: number,
     date: Date,
   ): string {
-    const padded = String(value).padStart(Math.max(1, config.padding), '0');
     const yyyy = String(date.getUTCFullYear());
     const yy = yyyy.slice(-2);
     const mm = String(date.getUTCMonth() + 1).padStart(2, '0');
@@ -143,15 +142,15 @@ export class NumberingService {
     return (config.template || DEFAULT_WORK_ORDER_NUMBERING.template)
       .replace(
         /\{PREFIX\}/gi,
-        config.prefix || DEFAULT_WORK_ORDER_NUMBERING.prefix,
+        config.prefix ?? DEFAULT_WORK_ORDER_NUMBERING.prefix,
       )
       .replace(/\{YYYY\}/g, yyyy)
       .replace(/\{YY\}/g, yy)
       .replace(/\{MM\}/g, mm)
       .replace(/\{DD\}/g, dd)
-      .replace(/\{NNNN+\}/g, (match) => {
-        const width = match.length - 3;
-        return String(value).padStart(Math.max(width, 1), '0');
+      .replace(/\{N+\}/g, (match) => {
+        const width = match.length - 2;
+        return String(value).padStart(Math.max(width, config.padding, 1), '0');
       });
   }
 }
